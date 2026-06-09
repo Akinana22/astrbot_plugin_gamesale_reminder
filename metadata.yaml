@@ -1,0 +1,24 @@
+name: astrbpt_plugin_gamesale_reminder
+display_name: 游戏折扣提醒
+desc: NS 平台游戏折扣监控与愿望单提醒。自动获取任天堂商店认证，支持全量/增量爬取游戏信息与折扣周期，提供模糊查询、愿望单管理、折扣推送等功能。
+help: |
+  指令：
+    getdata [平台] [模式]  手动触发任天堂游戏基础信息爬取
+        平台：ns（原版Switch），ns2（witch2），默认 ns2
+        模式：inc（增量，默认），all（全量，会重置断点）
+    getsaledata [平台]      手动触发任天堂游戏折扣信息增量爬取，默认 ns2
+    remindhelp              显示帮助
+    remindme <游戏名>       模糊查询游戏（支持相似度匹配）
+    confirm [序号 | np | pp | 0] 
+        确认游戏（默认序号为 1）
+        np/pp 翻页
+        0 进入深层拼音搜索
+    remindlist             查看当前会话的愿望单
+    remindnow              立即检查愿望单中的游戏折扣并推送图片
+    releaselist [月份] [年份] 获取指定月份未发售游戏列表
+        月份在前，年份可选，默认当前月份
+author: Akinana
+version: v0.8.2
+support_platforms:
+  - aiocqhttp
+astrbot_version: ">=4.17"
