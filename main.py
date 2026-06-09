@@ -8,34 +8,28 @@ import asyncio
 import random
 import shutil
 import json
+import html
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 
 import aiohttp
 import aiosqlite
-import sqlean
 from pypinyin import pinyin, Style
 import pykakasi
 
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star
-from astrbot.api import logger, AstrBotConfig
-from astrbot.core.agent.tool import ToolSet
+from astrbot.api import logger, AstrBotConfig, ToolSet
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 import astrbot.api.message_components as Comp
 
-from .common_utils import (
-    ImageGenerator,
-    AITool,
-    FileNameGenerator,
-)
+from .image_generator import ImageGenerator
 
 from .session_managers import (
     SessionUtils,
     PermissionManager,
     PlatformManager,
-    SessionGamesManager,
 )
 
 from .time_utils import (
@@ -48,7 +42,6 @@ from .time_utils import (
     now_in_config_tz,
     DateParser,
     TaskScheduler,
-    RemainingTimeCalculator,
 )
 
 from .ns_credential_fetcher import NSCredentialFetcher
@@ -59,7 +52,7 @@ class DiscountReminderPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
         self.config = config if config is not None else {}
-        self.name = "astrbpt_plugin_gamesale_reminder"
+        self.name = "astrbot_plugin_gamesale_reminder"
 
         # 初始化时区配置
         tz_config = self.config.get("timezone", "+8")
@@ -92,7 +85,6 @@ class DiscountReminderPlugin(Star):
         self.platform_mgr = PlatformManager(
             self.config, platforms=["ns", "steam", "ps", "xbox"]
         )
-        self.ai_tool = AITool(context)
         self.scheduler = TaskScheduler(tz_mode, tz_value)  # 传入时区配置
 
         # 异步加载缓存
@@ -968,6 +960,9 @@ class DiscountReminderPlugin(Star):
 
     # -------------------- 定时任务 --------------------
     async def _init_scheduler(self):
+        # 启动时清理过期图片
+        await self.db.cleanup_orphan_images(self.image_gen.img_dir)
+
         await self.scheduler.start()
         # 基础信息每日更新，默认为对应时区每天02:00，默认时区为北京时间
         basic_cron = self.config.get("ns_basic_info_cron", "0 2 * * *")
@@ -1002,6 +997,68 @@ class DiscountReminderPlugin(Star):
             result = await self._run_task(self._crawl_ns_sales_info, platform_code)
             logger.info(f"定时任务任天堂游戏折扣信息爬取结果: {result}")
             await asyncio.sleep(60)
+
+        # 爬取完成后推送愿望单折扣变化
+        await self._push_wishlist_changes()
+
+    async def _push_wishlist_changes(self):
+        """检查愿望单中游戏的折扣变化并推送通知"""
+        now_utc = utc_now_str()
+        groups = await self.db.get_all_wishlist_groups()
+        if not groups:
+            return
+
+        notifications = {}
+
+        for group_id in groups:
+            wishlist = await self.db.get_group_wishlist_all_users(group_id)
+            if not wishlist:
+                continue
+            for item in wishlist:
+                user_id = item["user_id"]
+                game_id = item["internal_id"]
+                name = item["name"]
+                chn_name = item["chinese_name"]
+
+                is_active = await self.db.is_sale_active(game_id, now_utc)
+                prev_state = await self.db.get_push_state(game_id, group_id, user_id)
+
+                if is_active:
+                    discount = await self.db.get_discount_details(game_id, now_utc)
+                    if discount:
+                        price, label, end_time = discount
+                        if not prev_state or prev_state[0] != end_time or prev_state[1] != price:
+                            is_new = not prev_state or prev_state[0] is None
+                            await self.db.update_push_state(game_id, group_id, user_id, end_time, price, label)
+                            notifications.setdefault(group_id, []).append(
+                                (user_id, name, chn_name, price, label, end_time, is_new)
+                            )
+                else:
+                    if prev_state and prev_state[0] is not None:
+                        await self.db.update_push_state(game_id, group_id, user_id, None, None, None)
+                        notifications.setdefault(group_id, []).append(
+                            (user_id, name, chn_name, None, None, None, False)
+                        )
+
+        if not notifications:
+            return
+
+        for group_id, items in notifications.items():
+            lines = ["📢 愿望单折扣更新："]
+            for user_id, name, chn_name, price, label, end_time, is_new in items:
+                display = chn_name if chn_name else name
+                if price is None:
+                    lines.append(f"• {display} 折扣已结束")
+                elif is_new:
+                    end_local = convert_to_config_tz(end_time)
+                    lines.append(f"• 🆕 {display} 新折扣：{price}日元（{label}），截止 {end_local.strftime('%m-%d %H:%M')}")
+                else:
+                    end_local = convert_to_config_tz(end_time)
+                    lines.append(f"• {display} 折扣更新：{price}日元（{label}），截止 {end_local.strftime('%m-%d %H:%M')}")
+            try:
+                await self.context.send_message(group_id, [Comp.Plain("\n".join(lines))])
+            except Exception as e:
+                logger.warning(f"推送通知到群 {group_id} 失败: {e}")
 
     # -------------------- 指令 --------------------
     @filter.command("getdata")
@@ -1094,9 +1151,127 @@ class DiscountReminderPlugin(Star):
         help_text = self.config.get("help_text", "请查看插件文档或联系管理员。")
         yield event.plain_result(f"📢 折扣提醒帮助\n{help_text}")
 
+    # -------------------- 搜索工具函数 --------------------
+    @staticmethod
+    def _is_cjk(ch: str) -> bool:
+        return "\u4e00" <= ch <= "\u9fff"
+
+    @staticmethod
+    def _levenshtein_distance(s1: str, s2: str) -> int:
+        if len(s1) < len(s2):
+            s1, s2 = s2, s1
+        if not s2:
+            return len(s1)
+        prev = list(range(len(s2) + 1))
+        for i, c1 in enumerate(s1):
+            curr = [i + 1]
+            for j, c2 in enumerate(s2):
+                curr.append(min(
+                    prev[j + 1] + 1,
+                    curr[j] + 1,
+                    prev[j] + (0 if c1 == c2 else 1),
+                ))
+            prev = curr
+        return prev[-1]
+
+    def _tokenize_query(self, query: str) -> list:
+        """将查询拆分为带权重的 token 列表 [(token, weight)]，weight = len(token)^2"""
+        tokens = []
+        segments = []
+        current = []
+        for ch in query:
+            if self._is_cjk(ch) or ch.isalnum() or ch == "_":
+                current.append(ch)
+            else:
+                if current:
+                    segments.append("".join(current))
+                    current = []
+        if current:
+            segments.append("".join(current))
+
+        for seg in segments:
+            if all(self._is_cjk(c) for c in seg):
+                n = len(seg)
+                for length in range(2, min(5, n + 1)):
+                    for i in range(n - length + 1):
+                        token = seg[i:i + length]
+                        tokens.append((token, length * length))
+            else:
+                if len(seg) >= 3:
+                    tokens.append((seg, len(seg) * len(seg)))
+
+        if not tokens:
+            tokens.append((query, len(query) * len(query)))
+        return tokens
+
+    def _to_ascii(self, text: str) -> str:
+        """文本转 ASCII 字母（日文→罗马字，中文→拼音）"""
+        if not text:
+            return ""
+        text = re.sub(r"(?i)\s*Nintendo Switch 2 Edition\s*$", "", text)
+        has_kana = any("\u3040" <= ch <= "\u30ff" for ch in text)
+        if has_kana:
+            kks = pykakasi.kakasi()
+            result = "".join(item["hepburn"] for item in kks.convert(text))
+        else:
+            result = "".join(
+                item[0].lower() for item in pinyin(text, style=Style.NORMAL)
+            )
+        return "".join(c for c in result if c.isalpha() and ord(c) < 128)
+
+    def _pinyin_similarity(self, query: str, name: str, chinese_name: str) -> float:
+        """计算拼音/罗马字相似度 (0-1)"""
+        query_ascii = self._to_ascii(query)
+        if not query_ascii:
+            return 0.0
+        candidates = []
+        if name:
+            candidates.append(self._to_ascii(name))
+        if chinese_name:
+            candidates.append(self._to_ascii(chinese_name))
+        if not candidates:
+            return 0.0
+        best_sim = 0.0
+        for cand in candidates:
+            if not cand:
+                continue
+            dist = self._levenshtein_distance(query_ascii, cand)
+            max_len = max(len(query_ascii), len(cand))
+            sim = 1.0 - dist / max_len if max_len > 0 else 0.0
+            if sim > best_sim:
+                best_sim = sim
+        return best_sim
+
+    def _score_candidate(self, query: str, tokens: list, name: str, chinese_name: str) -> float:
+        """多因子统合打分"""
+        score = 0.0
+        name_lower = (name or "").lower()
+        chn = chinese_name or ""
+
+        # 完整搜索词子串匹配（决定性加分）
+        if query in chn:
+            score += 1000
+        if query.lower() in name_lower:
+            score += 500
+
+        # n-gram 重叠（加权）
+        for token, weight in tokens:
+            token_lower = token.lower()
+            if token in chn:
+                score += weight * 2
+            if token_lower in name_lower:
+                score += weight
+
+        # 拼音/罗马字相似度（平局决胜）
+        pinyin_sim = self._pinyin_similarity(query, name, chinese_name)
+        score += pinyin_sim * 50
+
+        return score
+
+    # -------------------- remindme 指令 --------------------
     @filter.command("remindme")
     async def remind_me(self, event: AstrMessageEvent, game_name: str):
-        """模糊查询游戏（使用下划线替代空格）"""
+        """模糊查询游戏"""
         allowed, reason = await self.permission_mgr.check_permission(event)
         if not allowed:
             logger.info(f"❌ 无权限: {reason}")
@@ -1107,45 +1282,18 @@ class DiscountReminderPlugin(Star):
             yield event.plain_result("❌ 请提供游戏名")
             return
 
-        # 第一层：LIKE 多关键词匹配（汉字拆2-4子串，单词长度≥3保留完整词）
-        def is_cjk(ch: str) -> bool:
-            return "\u4e00" <= ch <= "\u9fff"
+        tokens = self._tokenize_query(search_name)
 
-        keywords = set()
-        segments = []
-        current = []
-        for ch in search_name:
-            if is_cjk(ch) or ch.isalnum() or ch == "_":
-                current.append(ch)
-            else:
-                if current:
-                    segments.append("".join(current))
-                    current = []
-        if current:
-            segments.append("".join(current))
-
-        for seg in segments:
-            if all(is_cjk(c) for c in seg):
-                n = len(seg)
-                for length in range(2, min(5, n + 1)):
-                    for i in range(n - length + 1):
-                        keywords.add(seg[i : i + length])
-            else:
-                if len(seg) >= 3:
-                    keywords.add(seg)
-
-        if not keywords:
-            keywords.add(search_name)
-
-        # 构建 SQL 查询（不限制数量）
+        # SQL LIKE 召回候选（无数量限制）
         conditions = []
         params = []
-        for kw in keywords:
+        unique_tokens = list({t for t, _ in tokens})
+        for token in unique_tokens:
             conditions.append("(name LIKE ? OR chinese_name LIKE ?)")
-            params.extend([f"%{kw}%", f"%{kw}%"])
+            params.extend([f"%{token}%", f"%{token}%"])
 
         sql = f"""
-            SELECT internal_id, name, chinese_name
+            SELECT internal_id, name, chinese_name, platform
             FROM ns_game_info
             WHERE is_active = 1 AND ({' OR '.join(conditions)})
         """
@@ -1154,210 +1302,47 @@ class DiscountReminderPlugin(Star):
             cursor = await conn.execute(sql, params)
             rows = await cursor.fetchall()
 
-        if rows:
-            # 计算每个游戏匹配到的最大关键词长度
-            scored = []
-            for row in rows:
-                internal_id, name, chn_name = row
-                max_len = 0
-                # 检查 name 和 chinese_name 中包含的所有关键词，取最大长度
-                for kw in keywords:
-                    kw_len = len(kw)
-                    if kw_len > max_len:
-                        if (name and kw in name) or (chn_name and kw in chn_name):
-                            max_len = kw_len
-                scored.append((max_len, internal_id, name, chn_name))
-            # 按最大长度降序排序，长度相同按 internal_id 升序
-            scored.sort(key=lambda x: (-x[0], x[1]))
-            # 取前 10 条
-            top_rows = [
-                (internal_id, name, chn_name)
-                for (_, internal_id, name, chn_name) in scored[:10]
-            ]
+        # 统合打分
+        scored = []
+        for internal_id, name, chn_name, platform in rows:
+            s = self._score_candidate(search_name, tokens, name, chn_name)
+            scored.append((s, internal_id, name, chn_name, platform))
 
-            self.user_search_results[event.unified_msg_origin] = {
-                "type": "fuzzy_search",
-                "results": top_rows,
-                "page": 0,
-                "page_size": 3,
-                "timestamp": datetime.now(),
-                "layer": 1,
-                "original_input": search_name,
-            }
-            await self._send_search_result(event, 0)
-            return
-
-        # 第一层无结果，直接进入第二层
-        await self._second_layer_search(event, search_name)
-
-    async def _second_layer_search(self, event: AstrMessageEvent, search_name: str):
-        """第二层：片段匹配（拼音/罗马字 + 编辑距离）"""
-        logger.info(f"[remindme] 进入第二层片段匹配搜索: {search_name}")
-
-        # ---------- 辅助函数 ----------
-        def is_cjk(ch: str) -> bool:
-            return "\u4e00" <= ch <= "\u9fff"
-
-        def get_pieces(text: str) -> list:
-            """将文本按第一层规则拆分为片段（汉字拆2-4子串，单词保留整词）"""
-            if not text:
-                return []
-            pieces = set()
-            # 分段
-            segments = []
-            current = []
-            for ch in text:
-                if is_cjk(ch) or ch.isalnum() or ch == "_":
-                    current.append(ch)
-                else:
-                    if current:
-                        segments.append("".join(current))
-                        current = []
-            if current:
-                segments.append("".join(current))
-
-            for seg in segments:
-                if all(is_cjk(c) for c in seg):
-                    n = len(seg)
-                    for length in range(2, min(5, n + 1)):
-                        for i in range(n - length + 1):
-                            pieces.add(seg[i : i + length])
-                else:
-                    if len(seg) >= 3:
-                        pieces.add(seg)
-            return list(pieces)
-
-        def remove_suffix(text: str) -> str:
-            return re.sub(r"(?i)\s*Nintendo Switch 2 Edition\s*$", "", text)
-
-        def to_ascii(text: str, for_name: bool) -> str:
-            """文本转 ASCII 字母（日文→罗马字，中文→拼音）"""
-            if not text:
-                return ""
-            text = remove_suffix(text)
-            has_kana = any("\u3040" <= ch <= "\u30ff" for ch in text)
-            if has_kana:
-                kks = pykakasi.kakasi()
-                result = "".join(item["hepburn"] for item in kks.convert(text))
-            else:
-                result = "".join(
-                    item[0].lower() for item in pinyin(text, style=Style.NORMAL)
+        # 如果 token 匹配少，对全库做拼音补充召回
+        if len(scored) < 5:
+            async with aiosqlite.connect(str(self.db.db_path)) as conn:
+                cursor = await conn.execute(
+                    "SELECT internal_id, name, chinese_name, platform FROM ns_game_info WHERE is_active = 1"
                 )
-            return "".join(c for c in result if c.isalpha() and ord(c) < 128)
+                all_games = await cursor.fetchall()
+            scored_ids = {item[1] for item in scored}
+            for internal_id, name, chn_name, platform in all_games:
+                if internal_id not in scored_ids:
+                    pinyin_sim = self._pinyin_similarity(search_name, name, chn_name)
+                    if pinyin_sim > 0.4:
+                        s = self._score_candidate(search_name, tokens, name, chn_name)
+                        scored.append((s, internal_id, name, chn_name, platform))
 
-        # ---------- 准备 ----------
-        user_ascii = to_ascii(search_name, for_name=False)
-        len_user = len(user_ascii)
-        tolerance = max(3, len_user // 2)
-        logger.info(
-            f"[remindme] 用户输入: {search_name} -> ASCII: {user_ascii}, 长度: {len_user}, 宽容度: {tolerance}"
-        )
-
-        # 获取所有活跃游戏（限制数量）
-        async with aiosqlite.connect(str(self.db.db_path)) as conn:
-            cursor = await conn.execute(
-                "SELECT internal_id, name, chinese_name FROM ns_game_info WHERE is_active = 1 LIMIT 2000"
-            )
-            all_games = await cursor.fetchall()
-        logger.info(f"[remindme] 共获取 {len(all_games)} 个活跃游戏")
-
-        # ---------- 计算匹配 ----------
-        def calc_matches():
-            conn = sqlean.connect(":memory:")
-            try:
-                # 创建临时表存储候选片段
-                conn.execute("CREATE TEMP TABLE pieces(id INTEGER, ascii TEXT)")
-                game_piece_count = 0
-                for internal_id, name, chn_name in all_games:
-                    # 处理 name
-                    name_pieces = get_pieces(name or "")
-                    for piece in name_pieces:
-                        ascii_piece = to_ascii(piece, for_name=True)
-                        if ascii_piece:
-                            conn.execute(
-                                "INSERT INTO pieces VALUES (?, ?)",
-                                (internal_id, ascii_piece),
-                            )
-                    # 处理 chinese_name
-                    chn_pieces = get_pieces(chn_name or "")
-                    for piece in chn_pieces:
-                        ascii_piece = to_ascii(piece, for_name=False)
-                        if ascii_piece:
-                            conn.execute(
-                                "INSERT INTO pieces VALUES (?, ?)",
-                                (internal_id, ascii_piece),
-                            )
-                            game_piece_count += 1
-                logger.info(f"[remindme] 共生成 {game_piece_count} 个片段（含重复）")
-
-                # 计算每个游戏的最佳匹配（最小编辑距离）
-                # 先获取所有不同的游戏ID
-                cur = conn.execute("SELECT DISTINCT id FROM pieces")
-                game_ids = [row[0] for row in cur.fetchall()]
-                matches = []
-                for gid in game_ids:
-                    # 查询该游戏所有片段的 ASCII 及其与用户输入的编辑距离
-                    cur = conn.execute("SELECT ascii FROM pieces WHERE id = ?", (gid,))
-                    pieces_ascii = [row[0] for row in cur.fetchall()]
-                    min_dist = None
-                    for ascii_str in pieces_ascii:
-                        dist = conn.execute(
-                            "SELECT levenshtein(?, ?)", (ascii_str, user_ascii)
-                        ).fetchone()[0]
-                        if min_dist is None or dist < min_dist:
-                            min_dist = dist
-                    if min_dist is not None and min_dist <= tolerance:
-                        matches.append((gid, min_dist))
-
-                # 按距离排序，取前20
-                if matches:
-                    logger.info(f"[remindme] 匹配到 {len(matches)} 个游戏，前20条距离:")
-                    for i, (gid, dist) in enumerate(matches[:20], 1):
-                        logger.info(f"  {i}. id={gid}, dist={dist}")
-                else:
-                    logger.info("[remindme] 未匹配到任何游戏")
-                matched_ids = [gid for gid, _ in matches[:20]]
-                return matched_ids
-            finally:
-                conn.close()
-
-        try:
-            matched_ids = await asyncio.to_thread(calc_matches)
-        except Exception as e:
-            logger.error(f"片段匹配失败: {e}", exc_info=True)
-            await event.send(event.plain_result("❌ 拼音搜索失败，请稍后重试"))
+        if not scored:
+            yield event.plain_result(f"❌ 未找到与「{search_name}」相关的游戏")
             return
 
-        if not matched_ids:
-            await event.send(
-                event.plain_result(f"❌ 未找到与「{search_name}」相关的游戏")
-            )
-            return
+        scored.sort(key=lambda x: -x[0])
+        top = scored[:15]
+        results = [(internal_id, name, chn_name, platform) for (_, internal_id, name, chn_name, platform) in top]
 
-        # 获取匹配的完整游戏信息
-        async with aiosqlite.connect(str(self.db.db_path)) as conn:
-            placeholders = ",".join("?" for _ in matched_ids)
-            cursor = await conn.execute(
-                f"SELECT internal_id, name, chinese_name FROM ns_game_info WHERE internal_id IN ({placeholders})",
-                matched_ids,
-            )
-            rows = await cursor.fetchall()
-
-        logger.info(f"[remindme] 最终返回 {len(rows)} 个匹配游戏")
-        # 存储结果
         self.user_search_results[event.unified_msg_origin] = {
             "type": "fuzzy_search",
-            "results": rows,
+            "results": results,
             "page": 0,
-            "page_size": 3,
+            "page_size": 10,
             "timestamp": datetime.now(),
-            "layer": 2,
             "original_input": search_name,
         }
         await self._send_search_result(event, 0)
 
     async def _send_search_result(self, event: AstrMessageEvent, page: int):
-        """发送当前页的搜索结果（内部方法）"""
+        """发送搜索结果图片"""
         user_key = event.unified_msg_origin
         stored = self.user_search_results.get(user_key)
         if not stored or stored.get("type") != "fuzzy_search":
@@ -1366,30 +1351,63 @@ class DiscountReminderPlugin(Star):
         page_size = stored["page_size"]
         total = len(results)
         start = page * page_size
-        end = start + page_size
+        end = min(start + page_size, total)
         page_results = results[start:end]
 
         if not page_results:
             await event.send(event.plain_result("❌ 没有更多结果了"))
             return
 
-        lines = [
-            f"🔍 找到 {total} 个相关游戏（第 {page+1}/{((total-1)//page_size)+1} 页）："
-        ]
-        for idx, (_, name, chn_name) in enumerate(page_results, start + 1):
-            # 显示格式：中文名（原名）
-            if chn_name:
-                display = f"{chn_name}（{name}）"
-            else:
-                display = name
-            lines.append(f"{idx}. {display}")
+        search_name = stored.get("original_input", "")
+        search_name_esc = html.escape(search_name)
+
+        items_html = ""
+        for idx, (_, name, chn_name, platform) in enumerate(page_results, start + 1):
+            display = chn_name if chn_name else name
+            original = f"<span style=\"color:#7f8c8d;font-size:11px;\">（{html.escape(name)}）</span>" if chn_name else ""
+            pf = platform or ""
+            items_html += f"""
+            <div style="display:flex;justify-content:space-between;align-items:baseline;background:white;padding:3px 8px;border-radius:4px;margin-bottom:2px;">
+                <span style="font-weight:600;color:#2c3e50;font-size:13px;">{idx}. {html.escape(display)} {original}</span>
+                <span style="color:#95a5a6;font-size:10px;">[{html.escape(pf)}]</span>
+            </div>"""
+
+        page_info = f"第 {page+1}/{((total-1)//page_size)+1} 页" if total > page_size else ""
+        nav_hint = "使用 confirm np/pp 翻页，confirm [序号] 选择游戏" if total > page_size else "使用 confirm [序号] 选择游戏"
+
+        html = f"""
+        <div class="search-container" style="display:inline-block;font-family:'Segoe UI',system-ui,sans-serif;background:#f0f2f5;border-radius:12px;padding:10px;">
+            <div style="text-align:center;margin-bottom:8px;font-size:16px;font-weight:bold;color:#1e466e;">
+                🔍 搜索「{search_name_esc}」共 {total} 个结果 {page_info}
+            </div>
+            <div style="display:flex;flex-direction:column;gap:2px;">
+                {items_html}
+            </div>
+            <div style="text-align:center;color:#7f8c8d;font-size:10px;margin-top:8px;">{nav_hint}</div>
+        </div>
+        """
+
+        file_name = f"search_{re.sub(r'[^a-zA-Z0-9_\u4e00-\u9fff]', '_', search_name)[:30]}_{page}.png"
+        img_path = await self.image_gen.generate_image(
+            html=html,
+            output_name=file_name,
+            clip_selector=".search-container",
+            wait_selector=".search-container",
+        )
+        if img_path:
+            await event.send(event.image_result(str(img_path)))
+        else:
+            # 图片生成失败，回退文本
+            lines = [f"🔍 搜索「{search_name}」共 {total} 个结果 {page_info}"]
+            for idx, (_, name, chn_name, platform) in enumerate(page_results, start + 1):
+                display = f"{chn_name}（{name}）" if chn_name else name
+                lines.append(f"{idx}. {display} [{platform or ''}]")
+            if total > page_size:
+                lines.append(f"\n{nav_hint}")
+            await event.send(event.plain_result("\n".join(lines)))
 
         if total > page_size:
-            lines.append("\n使用 confirm np 查看下一页，confirm pp 查看上一页")
-        if stored.get("layer") == 1:
-            lines.append("若未找到，可使用 confirm 0 进行更精确的拼音搜索")
-        lines.append("使用 confirm [序号] 确认要添加的游戏（默认序号1）")
-        await event.send(event.plain_result("\n".join(lines)))
+            await event.send(event.plain_result(nav_hint))
 
     @filter.command("confirm")
     async def confirm(self, event: AstrMessageEvent, arg=None):
@@ -1440,31 +1458,13 @@ class DiscountReminderPlugin(Star):
             await self._send_search_result(event, new_page)
             return
 
-        if arg_str == "0":
-            if stored.get("layer") != 1:
-                await event.send(
-                    event.plain_result("❌ 当前不是第一层搜索结果，无法进入二层搜索")
-                )
-                return
-            original = stored.get("original_input")
-            if not original:
-                await event.send(
-                    event.plain_result(
-                        "❌ 无法获取原始搜索词，请重新使用 remindme 搜索"
-                    )
-                )
-                return
-            del self.user_search_results[user_key]
-            await self._second_layer_search(event, original)
-            return
-
         if arg_str is None:
             index = 1
         else:
             try:
                 index = int(arg_str.strip())
             except ValueError:
-                await event.send(event.plain_result("❌ 请输入数字序号、np、pp 或 0"))
+                await event.send(event.plain_result("❌ 请输入数字序号、np 或 pp"))
                 return
 
         results = stored["results"]
@@ -1475,7 +1475,7 @@ class DiscountReminderPlugin(Star):
             return
 
         selected = results[index - 1]
-        internal_id, name, chn_name = selected
+        internal_id, name, chn_name, _platform = selected
 
         group_id = event.get_group_id()
         user_id = event.get_sender_id()
@@ -1659,8 +1659,18 @@ class DiscountReminderPlugin(Star):
         event: AstrMessageEvent,
         month_str: Optional[str] = None,
         year_str: Optional[str] = None,
+        manufacturer: Optional[str] = None,
     ):
-        """获取指定月份游戏发售列表（月份在前，年份可选），按原始游戏名去重，合并平台，按发售日+发行商排序"""
+        """获取指定月份游戏发售列表（月份在前，年份可选，厂商可选），按原始游戏名去重，合并平台，按发售日+发行商排序"""
+
+        # 智能参数解析：year_str 可能实际上是厂商名
+        if year_str is not None and manufacturer is None:
+            try:
+                int(year_str)
+            except ValueError:
+                manufacturer = year_str
+                year_str = None
+
         allowed, reason = await self.permission_mgr.check_permission(event)
         if not allowed:
             logger.info(f"❌ 无权限: {reason}")
@@ -1746,6 +1756,12 @@ class DiscountReminderPlugin(Star):
                 continue
             matched += 1
 
+            # 厂商筛选
+            if manufacturer:
+                mfr = manufacturer_name or ""
+                if manufacturer.lower() not in mfr.lower():
+                    continue
+
             # 基本去重：直接使用原始游戏名作为键
             norm_name = name.strip()
             display_name = chn_name if chn_name else norm_name
@@ -1773,9 +1789,10 @@ class DiscountReminderPlugin(Star):
         )
 
         if not games_dict:
+            mfr_info = f"（厂商：{manufacturer}）" if manufacturer else ""
             await event.send(
                 event.plain_result(
-                    f"📭 {target_year}年{target_month}月暂无未发售游戏信息"
+                    f"📭 {target_year}年{target_month}月{mfr_info}暂无未发售游戏信息"
                 )
             )
             return
@@ -1801,7 +1818,10 @@ class DiscountReminderPlugin(Star):
 
         # 生成图片（使用裁剪容器的方式）
         data_version = str(max_changetime) if max_changetime else "0"
-        file_name = f"releaselist_{target_year}_{target_month}.png"
+        file_name = f"releaselist_{target_year}_{target_month}"
+        if manufacturer:
+            file_name += f"_{manufacturer[:10]}"
+        file_name += ".png"
 
         cached_version = await self.db.get_cached_image(file_name)
         img_path = self.image_gen.img_dir / file_name
@@ -1831,11 +1851,12 @@ class DiscountReminderPlugin(Star):
             </div>
             """
 
+        mfr_suffix = f" - {manufacturer}" if manufacturer else ""
         html = f"""
         <div class="release-container" style="display: inline-block; font-family: 'Segoe UI', system-ui, sans-serif; background: #f0f2f5; border-radius: 12px; padding: 8px;">
             <div style="text-align: center; margin-bottom: 8px;">
                 <img src="{logo_base64}" width="32" height="32" style="vertical-align: middle;">
-                <span style="font-size: 18px; font-weight: bold; margin-left: 8px; color: #1e466e;">{target_year}年{target_month}月 游戏发售列表（共{len(games)}款游戏）</span>
+                <span style="font-size: 18px; font-weight: bold; margin-left: 8px; color: #1e466e;">{target_year}年{target_month}月{mfr_suffix} 游戏发售列表（共{len(games)}款游戏）</span>
             </div>
             <div style="display: flex; flex-direction: column; gap: 4px;">
                 {items_html}
@@ -1862,10 +1883,7 @@ class DiscountReminderPlugin(Star):
                 )
             await event.send(event.plain_result("\n".join(lines)))
 
-    # -------------------- 占位方法 --------------------
-    async def _check_session_discounts(self, session_id: str):
-        pass
-
+    # -------------------- 生命周期 --------------------
     async def terminate(self):
         # 取消所有正在运行的任务
         if self._running_tasks:

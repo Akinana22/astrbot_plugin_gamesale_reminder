@@ -3,7 +3,7 @@
 支持两种配置方式：
   - 偏移量：如 "+8"、"-5"（必须以 +/- 开头，后跟整数）
   - 标准时区名：如 "Asia/Shanghai"、"America/New_York"
-包含日期解析、Cron表达式、定时任务调度、剩余时间计算等。
+包含日期解析、Cron表达式、定时任务调度等。
 """
 
 import asyncio
@@ -457,34 +457,3 @@ class TaskScheduler:
                 )
                 await asyncio.sleep(60)
 
-
-# ==================== 剩余时间计数器 ====================
-class RemainingTimeCalculator:
-    """剩余时间计算工具，返回 timedelta 对象，由调用方自行格式化"""
-
-    @staticmethod
-    def calculate(
-        release_time: Union[date, datetime], base_time: Union[date, datetime] = None
-    ) -> timedelta:
-        """
-        计算剩余时间，返回 timedelta 对象（正数表示未来，负数表示已过去）
-        :param release_time: 目标日期或时间
-        :param base_time: 基准时间，默认为当前时间（如果 release_time 是 date 则用 date.today()，否则用 datetime.now()）
-        """
-        if base_time is None:
-            if isinstance(release_time, datetime):
-                base_time = datetime.now()
-            else:
-                base_time = date.today()
-
-        if isinstance(release_time, date) and not isinstance(release_time, datetime):
-            release_dt = datetime.combine(release_time, datetime.min.time())
-        else:
-            release_dt = release_time
-
-        if isinstance(base_time, date) and not isinstance(base_time, datetime):
-            base_dt = datetime.combine(base_time, datetime.min.time())
-        else:
-            base_dt = base_time
-
-        return release_dt - base_dt

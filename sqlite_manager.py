@@ -116,6 +116,21 @@ class SQLiteManager:
             )
         """
         )
+        # 愿望单推送状态（用于检测折扣变化）
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS wishlist_push_state (
+                game_id INTEGER NOT NULL,
+                group_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                last_end_time TEXT,
+                last_discount_price INTEGER,
+                last_sale_label TEXT,
+                last_checked TEXT,
+                PRIMARY KEY (game_id, group_id, user_id)
+            )
+        """
+        )
 
         # 创建索引
         cursor.execute(
@@ -785,3 +800,87 @@ class SQLiteManager:
         )
         row = await cursor.fetchone()
         return row[0] if row else None
+
+    async def cleanup_orphan_images(self, img_dir: Path) -> int:
+        """删除 img_dir 中不在 image_cache 表里的孤立图片，返回删除数量"""
+        async with aiosqlite.connect(str(self.db_path)) as conn:
+            cursor = await conn.execute("SELECT file_name FROM image_cache")
+            cached_files = {row[0] for row in await cursor.fetchall()}
+
+        if not img_dir.exists():
+            return 0
+
+        deleted = 0
+        for f in img_dir.glob("*.png"):
+            if f.name not in cached_files:
+                try:
+                    f.unlink()
+                    deleted += 1
+                    logger.debug(f"清理过期图片: {f.name}")
+                except Exception as e:
+                    logger.error(f"清理图片失败 {f.name}: {e}")
+        if deleted:
+            logger.info(f"图片清理完成，删除 {deleted} 个过期文件")
+        return deleted
+
+    # -------------------- 愿望单推送状态 --------------------
+    async def get_push_state(self, game_id: int, group_id: str, user_id: str):
+        """获取上次推送时的折扣状态"""
+        async with aiosqlite.connect(str(self.db_path)) as conn:
+            cursor = await conn.execute(
+                "SELECT last_end_time, last_discount_price, last_sale_label FROM wishlist_push_state WHERE game_id=? AND group_id=? AND user_id=?",
+                (game_id, group_id, user_id),
+            )
+            row = await cursor.fetchone()
+            return row if row else None
+
+    async def update_push_state(self, game_id: int, group_id: str, user_id: str, end_time: str, discount_price: int, sale_label: str):
+        """更新推送状态"""
+        async with aiosqlite.connect(str(self.db_path)) as conn:
+            await conn.execute(
+                "INSERT OR REPLACE INTO wishlist_push_state (game_id, group_id, user_id, last_end_time, last_discount_price, last_sale_label, last_checked) VALUES (?,?,?,?,?,?,datetime('now'))",
+                (game_id, group_id, user_id, end_time, discount_price, sale_label),
+            )
+            await conn.commit()
+
+    async def get_wishlist_subscribers(self, game_id: int):
+        """获取订阅了某个游戏的所有用户"""
+        async with aiosqlite.connect(str(self.db_path)) as conn:
+            cursor = await conn.execute(
+                "SELECT group_id, user_id FROM ns_wishlist WHERE game_id = ?",
+                (game_id,),
+            )
+            return await cursor.fetchall()
+
+    async def get_all_wishlist_groups(self):
+        """获取所有有愿望单的群组"""
+        async with aiosqlite.connect(str(self.db_path)) as conn:
+            cursor = await conn.execute(
+                "SELECT DISTINCT group_id FROM ns_wishlist"
+            )
+            rows = await cursor.fetchall()
+            return [row[0] for row in rows]
+
+    async def get_group_wishlist_all_users(self, group_id: str) -> List[Dict]:
+        """获取某个群组所有用户的愿望单"""
+        async with aiosqlite.connect(str(self.db_path)) as conn:
+            cursor = await conn.execute(
+                """
+                SELECT w.user_id, g.internal_id, g.name, g.chinese_name
+                FROM ns_wishlist w
+                JOIN ns_game_info g ON w.game_id = g.internal_id
+                WHERE w.group_id = ?
+                ORDER BY w.created_at DESC
+                """,
+                (group_id,),
+            )
+            rows = await cursor.fetchall()
+            return [
+                {
+                    "user_id": row[0],
+                    "internal_id": row[1],
+                    "name": row[2],
+                    "chinese_name": row[3],
+                }
+                for row in rows
+            ]

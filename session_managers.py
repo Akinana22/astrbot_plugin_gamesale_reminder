@@ -1,14 +1,11 @@
 """
 会话与权限管理模块
-包含：会话工具、权限管理器、平台管理器、会话游戏管理器
 """
 
 import asyncio
-import json
 from pathlib import Path
 from typing import Dict, List, Any, Tuple
 
-import aiofiles
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api.star import Context
@@ -203,82 +200,3 @@ class PlatformManager:
 
 
 # ==================== 会话游戏管理器 ====================
-class SessionGamesManager:
-    """
-    管理每个会话的游戏列表，与公共游戏池协同。
-    存储结构：{session_id: [game_name1, game_name2, ...]}
-    持久化文件：sessions_games.json
-    """
-
-    def __init__(self, data_root: Path, game_pool: Dict[str, Any]):
-        """
-        :param data_root: 插件数据根目录
-        :param game_pool: 公共游戏信息池引用（用于确保游戏名一致性）
-        """
-        self.data_root = Path(data_root)
-        self.game_pool = game_pool
-        self.file_path = self.data_root / "sessions_games.json"
-        self.sessions: Dict[str, List[str]] = {}
-        self._lock = asyncio.Lock()
-        self._load()
-
-    def _load(self):
-        """同步加载会话游戏列表"""
-        if self.file_path.exists():
-            try:
-                with open(self.file_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                self.sessions = data
-            except Exception as e:
-                logger.error(f"加载会话游戏列表失败: {e}")
-                self.sessions = {}
-        else:
-            self.sessions = {}
-
-    async def _save(self):
-        """异步保存会话游戏列表"""
-        async with self._lock:
-            try:
-                async with aiofiles.open(self.file_path, "w", encoding="utf-8") as f:
-                    await f.write(
-                        json.dumps(self.sessions, ensure_ascii=False, indent=2)
-                    )
-            except Exception as e:
-                logger.error(f"保存会话游戏列表失败: {e}")
-
-    def _ensure_session(self, session_id: str):
-        if session_id not in self.sessions:
-            self.sessions[session_id] = []
-
-    async def add_game(self, session_id: str, game_name: str):
-        norm_name = game_name.strip().lower()
-        if norm_name not in self.game_pool:
-            raise ValueError(f"游戏 '{game_name}' 不在公共池中，请先添加游戏信息")
-        self._ensure_session(session_id)
-        if norm_name not in self.sessions[session_id]:
-            self.sessions[session_id].append(norm_name)
-            await self._save()
-
-    async def remove_game(self, session_id: str, game_name: str) -> bool:
-        norm_name = game_name.strip().lower()
-        if session_id in self.sessions and norm_name in self.sessions[session_id]:
-            self.sessions[session_id].remove(norm_name)
-            await self._save()
-            return True
-        return False
-
-    def get_games(self, session_id: str) -> List[str]:
-        return self.sessions.get(session_id, [])
-
-    async def set_games(self, session_id: str, games: List[str]):
-        norm_games = []
-        for g in games:
-            norm = g.strip().lower()
-            if norm not in self.game_pool:
-                raise ValueError(f"游戏 '{g}' 不在公共池中")
-            norm_games.append(norm)
-        self.sessions[session_id] = norm_games
-        await self._save()
-
-    def get_all_sessions(self) -> List[str]:
-        return list(self.sessions.keys())
